@@ -473,3 +473,74 @@ class CompleteHandoffResponse(BaseModel):
     owner: str
     fence: int
     completed_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# 交接单处理情况对账快照 reconciliation snapshot
+# ---------------------------------------------------------------------------
+
+
+class ReconSnapshotRequest(BaseModel):
+    handoff_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "非空交接单 id 列表；自动去除首尾空白，不得含空标识或重复标识。"
+            "按输入顺序固化每张交接单的处理情况"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ReconSnapshotRequest":
+        # 与批量报到一致地清洗：去首尾空白、拒绝空标识、拒绝批内重复。
+        cleaned: list[str] = []
+        for hid in self.handoff_ids:
+            name = hid.strip()
+            if not name:
+                raise ValueError("handoff_ids 不得包含空字符串")
+            if name in cleaned:
+                raise ValueError(f"交接单 {name!r} 在同一次提交中重复")
+            cleaned.append(name)
+        if not cleaned:
+            raise ValueError("handoff_ids 至少需要一个交接单")
+        self.handoff_ids = cleaned
+        return self
+
+
+class ReconItemView(BaseModel):
+    handoff_id: str = Field(description="交接单 id")
+    barrier_id: str = Field(description="来源屏障 id（交接单创建时记录）")
+    frozen_members: list[str] = Field(
+        description="来源屏障达标冻结成员快照（交接单创建时复制，快照再次固化）"
+    )
+    frozen_at: datetime = Field(description="来源屏障达标冻结时刻（UTC）")
+    status: str = Field(
+        description=(
+            "快照瞬间交接单状态：idle（空闲可认领：从未认领或租约已到期）"
+            "| leased（租约有效）| completed（已完成）"
+        )
+    )
+    completed_at: datetime | None = Field(
+        default=None, description="完成时刻（UTC）；仅 status=completed 出现"
+    )
+
+
+class ReconciliationSnapshotView(BaseModel):
+    batch_id: str = Field(description="批次标识")
+    created_at: datetime = Field(description="快照固化时刻（UTC，Redis 时间）")
+    completed_count: int = Field(
+        description="快照瞬间已完成（completed）的交接单数量"
+    )
+    pending_count: int = Field(
+        description="快照瞬间未完成（idle/leased）的交接单数量"
+    )
+    items: list[ReconItemView] = Field(
+        description="逐单处理情况，顺序与首次提交的 handoff_ids 一致；重试回放首次列表"
+    )
+    replayed: bool = Field(
+        default=False,
+        description=(
+            "true 表示同批次 + 相同列表重试，返回首次固化快照（未再次读取交接单）；"
+            "GET 回读已保存快照时恒为 false"
+        ),
+    )

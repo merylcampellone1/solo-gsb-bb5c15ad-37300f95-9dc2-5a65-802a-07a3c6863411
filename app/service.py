@@ -7,7 +7,14 @@ from datetime import datetime, timezone
 
 from .barrier_store import BarrierMeta, BarrierStore
 from .handoff_store import HandoffRecord
-from .models import BarrierView, GroupProgress, HandoffView
+from .models import (
+    BarrierView,
+    GroupProgress,
+    HandoffView,
+    ReconItemView,
+    ReconciliationSnapshotView,
+)
+from .recon_store import ReconSnapshot
 
 # 不可再变的终态：达标、截止、主动取消
 SETTLED_STATUSES = frozenset({"reached", "expired", "cancelled"})
@@ -202,6 +209,32 @@ def build_handoff_view(record: HandoffRecord) -> HandoffView:
         leased_at=_dt(record.leased_at) if leased and record.leased_at else None,
         expires_at=_dt(record.expires_at) if leased and record.expires_at else None,
         completed_at=_dt(record.completed_at) if completed and record.completed_at else None,
+    )
+
+
+def build_recon_view(snapshot: ReconSnapshot, replayed: bool = False) -> ReconciliationSnapshotView:
+    """把已固化的对账快照组装为对外视图。
+
+    视图内容全部来自快照自身（``recon:{batch}``），不回读任何交接单当前状态，
+    因此交接单后续被认领 / 到期接管 / 完成都不会改变同批次的返回。
+    """
+    return ReconciliationSnapshotView(
+        batch_id=snapshot.batch_id,
+        created_at=_dt(snapshot.created_at),
+        completed_count=snapshot.completed_count,
+        pending_count=snapshot.pending_count,
+        items=[
+            ReconItemView(
+                handoff_id=item.handoff_id,
+                barrier_id=item.barrier_id,
+                frozen_members=item.frozen_members,
+                frozen_at=_dt(item.frozen_at),
+                status=item.status,
+                completed_at=_dt(item.completed_at) if item.completed_at is not None else None,
+            )
+            for item in snapshot.items
+        ],
+        replayed=replayed,
     )
 
 
