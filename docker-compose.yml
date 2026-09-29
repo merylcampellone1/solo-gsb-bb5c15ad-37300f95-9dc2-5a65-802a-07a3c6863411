@@ -1,0 +1,40 @@
+services:
+  redis:
+    image: redis:7-alpine
+    # AOF 持久化：屏障元数据、名单（含运行中替补后的名单）、审计事件、
+    # 批量报到幂等记录均落盘。
+    # 原子报到 / 批量报到 / 取消 / 延期 / 替补全部在 Redis 单节点的 Lua 脚本内
+    # 串行执行，依赖单线程顺序保证并发唯一结果（含跨接口的 quorum 唯一冻结与
+    # 同幂等键只执行一次），因此不要在未做脚本兼容前改为分片集群。
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      # 屏障键（含替补审计事件与批量报到幂等记录）在截止时间之后额外保留多久
+      BARRIER_TTL_BUFFER_MS: "86400000"
+      # /wait 的轮询兜底间隔；Pub/Sub 同时承载 reached（单人/批量报到）/cancelled/
+      # deadline_extended/participant_replaced 四种唤醒消息
+      BARRIER_POLL_INTERVAL_S: "0.5"
+      BARRIER_MAX_WAIT_S: "3600"
+      # 达标结果交接单（/handoffs）的认领租约时长（秒，默认 30）：
+      # 租约到期可被他人接管，fence 单调递增；交接单本身无 TTL，独立持久保存
+      HANDOFF_LEASE_S: "30"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:
