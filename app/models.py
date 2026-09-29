@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -473,3 +474,85 @@ class CompleteHandoffResponse(BaseModel):
     owner: str
     fence: int
     completed_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# 交接单处理情况对账快照 reconciliation
+# ---------------------------------------------------------------------------
+
+# 批次标识允许字母 / 数字 / - _ . : 与空白，防止任意内容进入 Redis 键空间。
+_BATCH_ID_RE = re.compile(r"^[A-Za-z0-9\-_.: ]+$")
+
+
+class ReconciliationRequest(BaseModel):
+    handoff_ids: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "非空交接单 ID 列表，按输入顺序逐单记录；不得包含空标识或重复标识"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ReconciliationRequest":
+        cleaned: list[str] = []
+        for raw in self.handoff_ids:
+            hid = raw.strip()
+            if not hid:
+                raise ValueError("handoff_ids 不得包含空字符串")
+            if hid in cleaned:
+                raise ValueError(f"交接单 {hid!r} 在同一批次中重复")
+            cleaned.append(hid)
+        if not cleaned:
+            raise ValueError("handoff_ids 至少需要一个交接单")
+        self.handoff_ids = cleaned
+        return self
+
+
+def validate_batch_id(batch_id: str) -> str:
+    """校验路径中的批次标识：去首尾空白后非空、长度受限且字符安全。"""
+    bid = batch_id.strip()
+    if not bid:
+        raise ValueError("batch_id 不得为空白字符串")
+    if len(bid) > 128:
+        raise ValueError("batch_id 长度不得超过 128 字符")
+    if not _BATCH_ID_RE.fullmatch(bid):
+        raise ValueError("batch_id 只能包含字母、数字、空格与 - _ . : 字符")
+    return bid
+
+
+class SnapshotItemView(BaseModel):
+    handoff_id: str
+    barrier_id: str = Field(description="来源屏障 id（自交接单保存快照瞬间读取）")
+    status: str = Field(
+        description=(
+            "快照保存瞬间交接单的有效状态：completed（已完成）"
+            "| leased（租约有效，未完成）| idle（空闲或租约已到期，未完成）"
+        )
+    )
+    completed_at: datetime | None = Field(
+        default=None, description="完成时刻（UTC，仅 status=completed）"
+    )
+
+
+class ReconciliationView(BaseModel):
+    batch_id: str
+    created_at: datetime = Field(
+        description="首次快照保存时刻（UTC，以 Redis 时间裁决）；重试回放首次值"
+    )
+    handoff_ids: list[str] = Field(
+        description="首次提交的交接单列表（保序，用于复核与冲突比对）"
+    )
+    items: list[SnapshotItemView] = Field(
+        description="逐单处理情况，顺序与 handoff_ids 一致"
+    )
+    completed_count: int = Field(
+        description="已完成数量：保存瞬间 status=completed 的交接单数"
+    )
+    pending_count: int = Field(
+        description="未完成数量：保存瞬间 status 为 leased/idle 的交接单数"
+    )
+    replayed: bool = Field(
+        default=False,
+        description="true 表示同批次标识 + 相同列表的重试，响应为首次快照回放",
+    )

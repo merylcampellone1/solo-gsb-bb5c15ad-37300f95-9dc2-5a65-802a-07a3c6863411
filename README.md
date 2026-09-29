@@ -12,6 +12,7 @@
 - 支持**运行中参与者替补**：`POST /barriers/{id}/replace` 在原参与者**尚未报到**且屏障仍 `waiting` 时，把其**原子地替换为名单外的新标识**并**继承原分组**；替补与报到、取消、延期及其他替补并发时按 Redis 实际生效顺序**唯一生效**，并记录可分页查询的 `replaced` 审计事件、唤醒 `/wait`；达标、取消或截止后一律拒绝替补；
 - 提供**阻塞等待接口**：达标 / 取消时立即返回终态快照；截止时返回已报到成员与缺席名单；多个等待者通过 Redis Pub/Sub 一并被可靠唤醒（轮询兜底，消息丢失也不会睡死）；
 - 提供**达标结果交接（handoff）**：屏障达标后可 `POST /handoffs` 建立一份**独立持久保存**的交接单，复制达标快照 `quorum` / `frozen_at`（屏障到期回收不影响交接单）；交接单支持**栅栏令牌（fencing token）租约**——空闲或租约到期可被 `claim` 认领并获得**单调递增的 fence 与到期时间**，`renew` 续租、`complete` 完成均须携带 `owner` + `fence` 且租约仍有效；竞争认领、到期接管与旧凭证拒绝全部在 **Redis Lua 脚本内以 Redis 时间原子裁决**，完成后永久拒绝再次认领。
+- 提供**交接单处理情况对账快照（reconciliation）**：`PUT /reconciliation/batches/{batch_id}` 提交批次标识与非空交接单 ID 列表（拒绝批内重复 ID），首次提交时**按输入顺序**逐单定格来源屏障、保存瞬间状态（`completed` / `leased` / `idle`）与完成时间，返回已完成 / 未完成数量；各单读取与批次保存处于**同一段 Lua 脚本**的同一 Redis 瞬间，并发完成不会让同一批次混态；同批次同列表重试**回放首次快照**（`200`），列表不同返回 `409`；任一交接单不存在**整批失败且不占用批次标识**；快照键无 TTL，已保存快照不随交接单后续变化改写，`GET` 可随时复核。
 
 ## 一条命令启动（含 Redis）
 
@@ -504,6 +505,84 @@ curl -s -X POST http://localhost:8000/handoffs/1d2e…/complete \
 - 所有时间判定（租约是否到期、到期时间计算、完成时刻）都使用脚本内 `redis.call('TIME')` 的 **Redis 时钟**，应用服务器时钟回拨 / 偏移不影响裁决；
 - 交接单本体 `handoff:{id}` 与索引 `handoff:bybarrier:{barrier_id}` **从不设置 TTL**，与有回收周期的 `barrier:*` 键空间完全分离；compose 中 Redis 开启 AOF，交接单随 Redis 数据一起持久化。
 
+## 交接单处理情况对账快照（reconciliation）
+
+收尾人员可以把**一批交接单在某一时刻的处理情况**按**批次**固定为一份可复核的对账快照：逐单记录来源屏障、保存瞬间的状态与完成时间，并给出已完成 / 未完成数量。批次标识由调用方给定（如 `2026-09-29.payroll:team-a`），快照键 `recon:{batch_id}` **不设置 TTL**，与交接单本体一样独立持久保存。
+
+### 11.1 提交 / 重试批次快照 `PUT /reconciliation/batches/{batch_id}`
+
+请求体携带**非空**交接单 ID 列表，按**输入顺序**逐单定格：
+
+```bash
+curl -s -X PUT http://localhost:8000/reconciliation/batches/2026-09-29.payroll:team-a \
+  -H 'Content-Type: application/json' \
+  -d '{"handoff_ids":["1d2e…","3f4a…","5b6c…"]}'
+```
+
+首次提交返回 `201`：
+
+```json
+{
+  "batch_id": "2026-09-29.payroll:team-a",
+  "created_at": "2026-09-29T15:10:00.123456Z",
+  "handoff_ids": ["1d2e…", "3f4a…", "5b6c…"],
+  "items": [
+    {
+      "handoff_id": "1d2e…",
+      "barrier_id": "8f3c…",
+      "status": "completed",
+      "completed_at": "2026-09-29T15:05:00.000000Z"
+    },
+    {
+      "handoff_id": "3f4a…",
+      "barrier_id": "9a2b…",
+      "status": "leased",
+      "completed_at": null
+    },
+    {
+      "handoff_id": "5b6c…",
+      "barrier_id": "77dd…",
+      "status": "idle",
+      "completed_at": null
+    }
+  ],
+  "completed_count": 1,
+  "pending_count": 2,
+  "replayed": false
+}
+```
+
+字段说明：
+
+- `items[].status` 为**保存瞬间**交接单的有效状态，口径与 `GET /handoffs/{id}` 一致：`completed`（已完成）计入已完成；`leased`（租约有效）与 `idle`（从未认领或租约已到期）计入未完成；
+- 仅 `completed` 项带 `completed_at`（UTC）；`barrier_id` 为来源屏障；
+- `items` 顺序与请求 `handoff_ids` 完全一致；
+- `completed_count + pending_count == len(handoff_ids)`。
+
+重试与冲突语义：
+
+- **同一批次标识 + 完全相同的列表**（顺序敏感，换序视为另一份列表）重试：返回 `200`、`replayed=true`，**逐字段回放首次快照**（含首次 `created_at`、逐单状态 / 完成时间与计数），不再次读取交接单；
+- **同一批次标识但列表不同**（增删成员或换序）：返回 `409`，首次快照不可改写；
+- **任一交接单不存在**：整批失败返回 `404`，批次键在任何写入之前即终止，**不占用批次标识**——修正列表后用同一批次标识重试仍为首次创建（`201`）；
+- 列表为空、含空标识或**批内重复 ID** 返回 `422`；批次标识为空、超过 128 字符或含非法字符（仅允许字母、数字、空格与 `- _ . :`）返回 `422`。
+
+### 11.2 查询批次快照 `GET /reconciliation/batches/{batch_id}`
+
+返回已保存的快照；批次不存在 → `404`。查询**只读取快照本身、绝不回读交接单实时数据**：交接单随后被认领 / 续租 / 完成（甚至来源屏障到期回收）都不会改变响应——快照定格的就是提交瞬间的状态。
+
+```bash
+curl -s http://localhost:8000/reconciliation/batches/2026-09-29.payroll:team-a
+```
+
+GET 响应结构与提交相同（`replayed` 恒为 `false`）。
+
+### 11.3 原子性与持久化语义
+
+- 提交由一段 Redis Lua 脚本完成：`批次存在性与指纹比对（同列表回放 / 不同列表 409）→ 逐单存在性校验（任一不存在立即返回，批次键零写入）→ 以脚本内同一次 redis.call('TIME') 读取全部交接单并裁决有效状态 → 统计完成 / 未完成数量 → 逐单快照与计数整体 HSET 落盘` 全部在同一段脚本内一次完成；
+- Redis 单线程串行执行脚本：快照对全部交接单的读取发生在**同一个 Redis 瞬间**，并发的完成 / 认领 / 到期接管脚本不可能在读取过程中插入，同一批次绝不会混入不同时刻的状态（逐单状态与计数严格自洽）；
+- 状态裁决与交接单租约脚本共用 **Redis 时钟**，不依赖应用进程时钟；
+- 快照保存即只读：之后既不回读也不改写 `recon:*` 键；快照键**从不设置 TTL**，随 Redis AOF 一起持久化。
+
 ## 并发与一致性保证
 
 - 报到判定由一段 Lua 脚本完成：`名单校验 → 终态校验（frozen/cancel/截止）→ 去重 SADD（新成员才同步 HINCRBY 对应分组计数）→ 人数与分组配额判定 → 写入冻结快照（quorum + 分组计数）` 整体原子执行；取消由另一段 Lua 脚本完成：`终态校验（cancel/frozen/截止）→ 写入取消快照` 整体原子执行。Redis 单线程串行执行脚本，因此达标与取消**必有且仅有一个赢家**：并发报到（包括不同分组的成员同时补齐各自短板）只有一个请求得到 `reached`，或者取消请求得到 `cancelled`，互斥终态的成员集合、时间点、分组计数、取消原因均唯一确定。
@@ -531,9 +610,10 @@ REDIS_URL=redis://localhost:6379/0 HANDOFF_LEASE_S=30 \
 
 ```
 app/
-  main.py           FastAPI 路由与错误映射（屏障 + 交接单）
+  main.py           FastAPI 路由与错误映射（屏障 + 交接单 + 对账快照）
   barrier_store.py  Redis 键模型 + 原子报到/批量报到/取消/延期/替补 Lua 脚本（分组配额计数、审计事件、批量幂等记录、TTL 顺延）+ Pub/Sub
   handoff_store.py  达标结果交接单：独立持久键模型 + 原子创建/认领/续租/完成 Lua 脚本（Redis 时间裁决租约、单调递增 fence、终态拒绝）
+  reconciliation_store.py 批次对账快照：原子提交/重试 Lua 脚本（同一 Redis 瞬间逐单定格状态、指纹回放/冲突、缺单整批失败不占标识）+ 只读查询
   service.py        状态机视图组装、批量首次结果快照回放、交接单视图组装、阻塞等待（按最新 deadline / 替换后名单回读）
   models.py         请求/响应模型与校验
   config.py         环境变量配置（含 HANDOFF_LEASE_S）

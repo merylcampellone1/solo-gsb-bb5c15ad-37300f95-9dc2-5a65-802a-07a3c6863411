@@ -18,6 +18,10 @@
   POST   /handoffs/{hid}/renew              续租（须携带 owner + fence 且租约有效）
   POST   /handoffs/{hid}/complete           完成（须携带 owner + fence 且租约有效；完成后永久拒绝认领）
 
+交接单处理情况对账快照（按批次定格，已保存不改写）：
+  PUT    /reconciliation/batches/{batch_id} 提交批次（非空交接单列表；同批次同列表重试回放首次快照，列表不同 409）
+  GET    /reconciliation/batches/{batch_id} 查询已保存的批次对账快照
+
 交互文档：GET /docs（Swagger UI）
 """
 
@@ -75,10 +79,19 @@ from .models import (
     CreateHandoffRequest,
     ExtendDeadlineRequest,
     HandoffView,
+    ReconciliationRequest,
+    ReconciliationView,
     RenewRequest,
     RenewResponse,
     ReplaceRequest,
     ReplaceResponse,
+    SnapshotItemView,
+    validate_batch_id,
+)
+from .reconciliation_store import (
+    ReconciliationStore,
+    SnapshotBatchConflict,
+    SnapshotHandoffNotFound,
 )
 from .service import _dt, build_handoff_view, build_view, build_view_from_snapshot, wait_for_settle
 
@@ -91,6 +104,8 @@ async def lifespan(app: FastAPI):
     app.state.store = BarrierStore(redis)
     # 交接单与屏障共用同一 Redis 连接（但使用独立、无 TTL 的 handoff:* 键空间）。
     app.state.handoffs = HandoffStore(redis)
+    # 对账快照同样共用连接，使用独立、无 TTL 的 recon:* 键空间。
+    app.state.recon = ReconciliationStore(redis)
     yield
     await app.state.store.aclose()
 
@@ -100,9 +115,10 @@ app = FastAPI(
     description=(
         "并行任务协调收尾：创建屏障、幂等报到、批量幂等报到、阻塞等待达标、"
         "取消或截止、运行中延期与运行中参与者替补；屏障达标后可建立独立持久"
-        "保存的达标结果交接单，支持栅栏令牌租约（认领 / 续租 / 完成）。"
+        "保存的达标结果交接单，支持栅栏令牌租约（认领 / 续租 / 完成）；"
+        "并可按批次把交接单处理情况定格为可复核的对账快照。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -113,6 +129,10 @@ def store(request: Request) -> BarrierStore:
 
 def handoff_store(request: Request) -> HandoffStore:
     return request.app.state.handoffs
+
+
+def recon_store(request: Request) -> ReconciliationStore:
+    return request.app.state.recon
 
 
 @app.exception_handler(RedisError)
@@ -143,6 +163,8 @@ async def root() -> dict[str, object]:
             "claim_handoff": "POST /handoffs/{handoff_id}/claim",
             "renew_handoff": "POST /handoffs/{handoff_id}/renew",
             "complete_handoff": "POST /handoffs/{handoff_id}/complete",
+            "submit_reconciliation": "PUT /reconciliation/batches/{batch_id}",
+            "get_reconciliation": "GET /reconciliation/batches/{batch_id}",
         },
     }
 
@@ -720,3 +742,105 @@ async def complete_handoff(
         fence=payload.fence,
         completed_at=_dt(completed_at),
     )
+
+
+# ---------------------------------------------------------------------------
+# 交接单处理情况对账快照 reconciliation
+# ---------------------------------------------------------------------------
+
+
+def _build_reconciliation_view(snapshot, replayed: bool) -> ReconciliationView:
+    """把已保存的批次快照记录组装为对外视图；只使用快照内定格的字段。"""
+    return ReconciliationView(
+        batch_id=snapshot.batch_id,
+        created_at=_dt(snapshot.created_at),
+        handoff_ids=list(snapshot.handoff_ids),
+        items=[
+            SnapshotItemView(
+                handoff_id=item.handoff_id,
+                barrier_id=item.barrier_id,
+                status=item.status,
+                completed_at=(
+                    _dt(item.completed_at) if item.completed_at is not None else None
+                ),
+            )
+            for item in snapshot.items
+        ],
+        completed_count=snapshot.completed_count,
+        pending_count=snapshot.pending_count,
+        replayed=replayed,
+    )
+
+
+@app.put(
+    "/reconciliation/batches/{batch_id}",
+    response_model=ReconciliationView,
+    tags=["reconciliation"],
+)
+async def submit_reconciliation(
+    batch_id: str, payload: ReconciliationRequest, request: Request, response: Response
+) -> ReconciliationView:
+    """提交（或重试）一批交接单的处理情况对账快照。
+
+    - **按输入顺序定格**：首次提交时逐单记录来源屏障、保存瞬间的有效状态
+      （``completed`` / ``leased`` / ``idle``）与完成时间，并返回
+      ``completed_count``（已完成）与 ``pending_count``（未完成）；
+    - **整批原子**：各交接单读取与批次保存处于**同一段 Redis Lua 脚本**内，
+      以 **Redis 时间**裁决租约状态——并发完成 / 认领 / 到期接管不可能让同一
+      批次混入不同时刻的状态；
+    - **重试语义**：同一批次标识且交接单列表（顺序敏感）完全相同的请求回放
+      **首次快照**（``200``、``replayed=true``），不再次读取交接单；同一
+      批次标识但列表不同返回 ``409``；
+    - **整批失败不占标识**：列表中任一交接单不存在时整批失败（``404``），
+      批次键从未写入，不占用批次标识，可随后用同一批次标识重试；
+    - 列表含空标识或批内重复 ID 返回 ``422``；批次标识为空 / 含非法字符
+      （仅允许字母、数字、空格与 ``- _ . :``）也返回 ``422``；
+    - 快照键**不设 TTL**，已保存快照不随交接单后续认领 / 续租 / 完成而改写。
+    """
+    try:
+        batch_id = validate_batch_id(batch_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    try:
+        snapshot, created = await recon_store(request).submit(
+            batch_id, payload.handoff_ids
+        )
+    except SnapshotHandoffNotFound as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"交接单 {exc.args[0]!r} 不存在，整批快照未保存（未占用批次标识），"
+                "可修正列表后用同一批次标识重试"
+            ),
+        )
+    except SnapshotBatchConflict:
+        raise HTTPException(
+            status_code=409,
+            detail="该批次标识已保存过另一份交接单列表，不能改写首次快照",
+        )
+
+    response.status_code = 201 if created else 200
+    return _build_reconciliation_view(snapshot, replayed=not created)
+
+
+@app.get(
+    "/reconciliation/batches/{batch_id}",
+    response_model=ReconciliationView,
+    tags=["reconciliation"],
+)
+async def get_reconciliation(batch_id: str, request: Request) -> ReconciliationView:
+    """查询已保存的批次对账快照。
+
+    只返回快照保存瞬间定格的逐单状态 / 完成时间与计数，**不回读**交接单
+    当前数据：交接单之后被完成或租约流转都不会改变响应。批次不存在 → ``404``。
+    """
+    try:
+        batch_id = validate_batch_id(batch_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    snapshot = await recon_store(request).get(batch_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="对账批次不存在")
+    return _build_reconciliation_view(snapshot, replayed=False)
